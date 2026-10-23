@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Vacancy {
+  id             Int       @id @default(autoincrement())
+  hhId           String    @unique
+  title          String
+  url            String
+  company        String?
+  area           String?
+  salary         String?
+  experience     String?
+  workFormat     String?
+  employment     String?
+  responsesCount Int?
+  // Работодатель требует сопроводительное письмо.
+  letterRequired Boolean   @default(false)
+  publishedAt    DateTime?
+  discoveredAt   DateTime  @default(now())
+
+  // Полное описание подгружается со страницы вакансии только перед анализом.
+  description    String?
+  keySkills      String[]
+
+  // Результат ИИ. isRelevant = null — ещё не оценена.
+  isRelevant     Boolean?
+  matchScore     Int?
+  aiReason       String?
+  requirements   String?
+  coverLetter    String?
+  // Неудачные попытки анализа: после лимита вакансия больше не берётся.
+  analyzeErrors  Int       @default(0)
+
+  notifiedAt     DateTime?
+  isSkipped      Boolean   @default(false)
+  // Кнопка «Я отправила отклик» — когда откликнулась на hh.ru.
+  appliedAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([isRelevant, isSkipped])
+}

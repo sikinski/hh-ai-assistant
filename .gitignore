@@ -1,0 +1,6 @@
+node_modules
+# Keep environment variables out of version control
+.env
+
+# Личный профиль для ИИ — в репозитории только шаблон profile.example.md
+profile.md
