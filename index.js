@@ -5,9 +5,10 @@ import Fastify from 'fastify';
 import healthRoutes from './routes/health.js';
 import hhRoutes from './routes/hh.js';
 import aiRoutes from './routes/ai.js';
+import botRoutes from './routes/bot.js';
 
 import { processVacancies } from './services/process.js';
-import { startTelegramBot } from './services/telegram.js';
+import { closeBrowser } from './services/browser.js';
 import { PORT, CHECK_INTERVAL_MS } from './config.js';
 
 const app = Fastify({
@@ -47,18 +48,25 @@ async function runScheduledCheck() {
     }
 }
 
+// Смотритель останавливает HH через SIGTERM: закрываем Chromium, иначе профиль останется занят.
+async function shutdown() {
+    await closeBrowser();
+    await app.close();
+    process.exit(0);
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
 await app.register(healthRoutes);
 await app.register(hhRoutes);
 await app.register(aiRoutes);
+await app.register(botRoutes);
 
 try {
     await app.listen({
         port: PORT,
         host: '127.0.0.1',
-    });
-
-    startTelegramBot().catch((error) => {
-        app.log.error({ err: error }, 'Не удалось запустить Telegram-бота');
     });
 
     await runScheduledCheck();

@@ -1,12 +1,15 @@
 // Публичный API поиска hh.ru с апреля 2026 отвечает 403 без токена работодателя,
 // поэтому читаем данные, которые сайт встраивает в страницу
 // (<template id="HH-Lux-InitialState"> с JSON внутри).
+// Страницы открываем в своём Chromium (services/browser.js), а не fetch-ем:
+// так hh видит обычный браузер с куками и входом, а капчу можно решить в том же окне.
+
+import { getPage } from './browser.js';
 
 const HH_URL = 'https://hh.ru';
 
-const USER_AGENT =
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/130.0 Safari/537.36';
+// Сколько ждать загрузки страницы hh.
+const PAGE_TIMEOUT_MS = 60_000;
 
 const EXPERIENCE_LABELS = {
     noExperience: 'без опыта',
@@ -55,28 +58,54 @@ function htmlToText(html) {
         .trim();
 }
 
-async function fetchInitialState(url) {
-    const response = await fetch(url, {
-        headers: {
-            'User-Agent': USER_AGENT,
-            Accept: 'text/html,application/xhtml+xml',
-            'Accept-Language': 'ru-RU,ru;q=0.9',
-        },
-    });
+// Тип пользователя на последней открытой странице: 'applicant' — вошла, 'anonymous' — нет.
+let lastUserType = null;
 
-    if (!response.ok) {
-        throw new Error(`hh.ru вернул HTTP ${response.status} для ${url}`);
+export function getHhUserType() {
+    return lastUserType;
+}
+
+// Страницы hh открываем строго по одной: ручной /sync не должен влезть посреди проверки.
+let pageQueue = Promise.resolve();
+
+function fetchInitialState(url) {
+    const result = pageQueue.then(() => loadInitialState(url));
+
+    pageQueue = result.catch(() => {});
+    return result;
+}
+
+async function loadInitialState(url) {
+    const page = await getPage();
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
+
+    if (response && !response.ok()) {
+        throw new Error(`hh.ru вернул HTTP ${response.status()} для ${url}`);
     }
 
-    const html = await response.text();
-    const match = html.match(/<template[^>]*id="HH-Lux-InitialState"[^>]*>([\s\S]*?)<\/template>/);
+    // textContent шаблона — уже готовый JSON, без HTML-сущностей.
+    const json = await page.evaluate(
+        () => document.querySelector('template#HH-Lux-InitialState')?.content.textContent ?? null,
+    );
 
-    if (!match) {
+    if (!json) {
         // Обычно это капча или изменилась вёрстка hh.ru.
         throw new Error(`На странице hh.ru не найдены данные: ${url}`);
     }
 
-    return JSON.parse(decodeHtmlEntities(match[1]));
+    const state = JSON.parse(json);
+
+    if (state.userType && state.userType !== lastUserType) {
+        if (state.userType === 'applicant') {
+            console.log('Вход в hh.ru: вошла как соискатель');
+        } else {
+            console.warn(`Не вошла в hh.ru (userType: ${state.userType}) — войди в окне Chromium ассистента`);
+        }
+    }
+
+    lastUserType = state.userType ?? null;
+
+    return state;
 }
 
 function formatSalary(compensation) {

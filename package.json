@@ -11,6 +11,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
+    "login": "node scripts/login.js",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio"
@@ -19,7 +20,8 @@
     "@prisma/client": "6.19.3",
     "dotenv": "^18.0.8",
     "fastify": "^5.12.7",
-    "grammy": "^1.46.0"
+    "grammy": "^1.46.0",
+    "playwright-core": "1.59.1"
   },
   "devDependencies": {
     "prisma": "6.19.3"

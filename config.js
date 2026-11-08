@@ -26,21 +26,74 @@ export const HH_FILTERS = {
     // noExperience | between1And3 | between3And6 | moreThan6
     experience: ['between1And3', 'between3And6'],
     // REMOTE | HYBRID | ON_SITE | FIELD_WORK
-    workFormat: ['REMOTE'],
+    // HYBRID — hh иногда так помечает удалёнку; офисный гибрид отсеет ИИ.
+    workFormat: ['REMOTE', 'HYBRID'],
 };
 
-// Сколько страниц выдачи (по 20 вакансий) смотреть за одну проверку.
+// Второй поиск — всё про ИИ и нейросети. Стек, уровень и опыт тут не важны,
+// поэтому фильтра по опыту нет: неподходящее отсеет ИИ.
+// Без «агент»/«agentic»: hh склоняет их до «агента по недвижимости».
+export const HH_AI_FILTERS = {
+    ...HH_FILTERS,
+    text:
+        '(NAME:(AI OR ИИ OR LLM OR GPT OR ChatGPT OR нейросет* OR нейронн* OR промпт* OR prompt OR ML OR RAG ' +
+        'OR генеративн* OR n8n OR вайбкод* OR "vibe coding" OR "вайб кодинг") ' +
+        'OR "vibe coding" OR вайбкод* OR "вайб кодинг" OR "Claude Code" OR LangChain) ' +
+        'NOT NAME:(Junior OR Джуниор OR Стажер OR Стажёр OR Intern OR продаж* OR Sales OR бухгалтер* ' +
+        'OR риэлтор* OR риелтор* OR недвижимост* OR страхов* OR "Call Center")',
+    experience: [],
+};
+
+// Третий поиск — разработка на любом стеке (React, Angular, бэкенд…), где ИИ есть в тексте вакансии:
+// с нейросетями пишу на любом стеке. «Engineer»/«Инженер» не берём: hh тащит «помощника инженера».
+export const HH_DEV_AI_FILTERS = {
+    ...HH_FILTERS,
+    text:
+        'NAME:(Frontend OR Фронтенд OR Front-end OR Fullstack OR Фулстек OR Full-stack OR Backend OR Бэкенд ' +
+        'OR Back-end OR React OR Angular OR Node OR Python OR Разработчик OR Developer OR Программист ' +
+        'OR "Software Engineer") ' +
+        'AND (LLM OR нейросет* OR ChatGPT OR OpenAI OR Claude OR Cursor OR "vibe coding" OR вайбкод* ' +
+        'OR LangChain OR RAG OR "AI-ассистент*" OR "ИИ-ассистент*" OR "искусственного интеллекта" ' +
+        'OR "AI-агент*" OR "ИИ-агент*" OR генеративн*) ' +
+        'NOT NAME:(Junior OR Джуниор OR Стажер OR Стажёр OR Intern OR 1С OR Битрикс OR Bitrix OR QA ' +
+        'OR Тестировщик OR DevOps OR Аналитик)',
+    experience: [],
+};
+
+// Все поиски по очереди. Вакансия, найденная несколькими, сохраняется один раз.
+export const HH_SEARCHES = [
+    { name: 'Vue/Nuxt', filters: HH_FILTERS },
+    { name: 'ИИ', filters: HH_AI_FILTERS },
+    { name: 'Любой стек + ИИ', filters: HH_DEV_AI_FILTERS },
+];
+
+// Сколько страниц выдачи (по 20 вакансий) смотреть за одну проверку — в каждом поиске.
 export const HH_MAX_PAGES = 3;
 
 // Отсев до ИИ — экономим запросы к нейросети.
-// Больше откликов — вакансию не показываем.
-export const HH_MAX_RESPONSES = 500;
+// Больше откликов — вакансию не показываем. На удалённых фронтенд-вакансиях
+// обычно 1000–3000 откликов, отсекаем только совсем безнадёжные.
+export const HH_MAX_RESPONSES = 3000;
 // Зарплата в рублях указана и её максимум ниже — не показываем.
 export const HH_MIN_SALARY = 80000;
 
-// Модель Groq для hh. Лимит у Groq считается отдельно для каждой модели,
-// поэтому берём не ту, что у kwork-бота (openai/gpt-oss-120b).
-export const GROQ_MODEL = 'qwen/qwen3.8-27b';
+// Нейросети по порядку: кончился лимит у одной — берётся следующая.
+// Лимит Groq считается отдельно для каждой модели, но ключ общий с kwork, TG и geekjob:
+// gpt-oss-20b/120b — их основные модели, поэтому идут после своей qwen.
+// OpenRouter (:free) — ключ общий с TG и hostaway, ~50 запросов в сутки на всех.
+// json: false — модель не понимает response_format, JSON просим только в промпте.
+export const LLM_PROVIDERS = {
+    groq: { url: 'https://api.groq.com/openai/v1/chat/completions', keyEnv: 'GROQ_API_KEY' },
+    openrouter: { url: 'https://openrouter.ai/api/v1/chat/completions', keyEnv: 'OPENROUTER_API_KEY' },
+};
+
+export const LLM_MODELS = [
+    { provider: 'groq', model: 'qwen/qwen3.8-27b' },
+    { provider: 'groq', model: 'openai/gpt-oss-20b' },
+    { provider: 'groq', model: 'openai/gpt-oss-120b' },
+    { provider: 'openrouter', model: 'google/gemma-4-31b-it:free' },
+    { provider: 'openrouter', model: 'nvidia/nemotron-3-ultra-550b-a55b:free', json: false },
+];
 
 // Сколько вакансий анализировать за одну проверку.
 export const ANALYZE_BATCH_SIZE = 5;

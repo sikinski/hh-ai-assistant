@@ -4,3 +4,7 @@ node_modules
 
 # Личный профиль для ИИ — в репозитории только шаблон profile.example.md
 profile.md
+service.log
+
+# Профиль Chromium с входом в hh.ru и файлы для бота смотрителя
+data/

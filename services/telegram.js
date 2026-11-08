@@ -1,17 +1,22 @@
-import { Bot, InlineKeyboard, Keyboard } from 'grammy';
+import { Api, InlineKeyboard } from 'grammy';
 
 import { prisma } from '../db/db.js';
 
-// Получаем токен бота и ID Telegram-чата из переменных окружения.
-const token = process.env.TELEGRAM_BOT_TOKEN;
-const chatId = process.env.TELEGRAM_CHAT_ID;
+// Бот общий со смотрителем (MAIN_ASSISTANT): токен и чат те же, что в его .env.
+// Обновления бота читает только смотритель — два читателя у одного токена Telegram не пускает.
+// Поэтому HH лишь отправляет сообщения, а нажатия своих кнопок получает от смотрителя
+// через POST /bot/callback и /bot/command (routes/bot.js).
+const token = process.env.MAIN_BOT_TOKEN?.trim();
+const chatId = process.env.MAIN_BOT_CHAT_ID?.trim();
 
-// Без токена бот не создаётся: ассистент работает дальше и копит вакансии.
-export const bot = token ? new Bot(token) : null;
+const api = token ? new Api(token) : null;
 
 export function isTelegramConfigured() {
-    return Boolean(bot && chatId);
+    return Boolean(api && chatId);
 }
+
+// Кнопки с этим префиксом смотритель пересылает в HH: fwd:hh:<действие>:<параметр>.
+const CALLBACK_PREFIX = 'fwd:hh:';
 
 // Лимит Telegram — 4096 символов на сообщение, оставляем запас под оформление.
 const MAX_LETTER_LENGTH = 2500;
@@ -19,7 +24,7 @@ const MAX_REASON_LENGTH = 500;
 const MAX_TITLE_LENGTH = 300;
 
 // Экранируем текст для parse_mode: 'HTML'.
-function escapeHtml(text) {
+export function escapeHtml(text) {
     return String(text)
         .replaceAll('&', '&amp;')
         .replaceAll('<', '&lt;')
@@ -34,14 +39,6 @@ function truncate(text, maxLength) {
         ? `${value.slice(0, maxLength)}… (текст обрезан)`
         : value;
 }
-
-// Постоянная кнопка внизу чата.
-const MY_APPLICATIONS_BUTTON = '📋 Мои отклики';
-
-const mainKeyboard = new Keyboard()
-    .text(MY_APPLICATIONS_BUTTON)
-    .resized()
-    .persistent();
 
 // Сколько откликов на одной странице списка и номеров страниц в одном ряду кнопок.
 const APPLICATIONS_PAGE_SIZE = 10;
@@ -59,7 +56,7 @@ async function buildApplicationsPage(page) {
     if (total === 0) {
         return {
             text:
-                '📋 Откликов пока нет.\n\n' +
+                '📋 Откликов на hh пока нет.\n\n' +
                 'Когда откликнешься на hh.ru, нажми «✅ Я отправила отклик» под вакансией.',
             keyboard: undefined,
         };
@@ -85,8 +82,8 @@ async function buildApplicationsPage(page) {
     });
 
     const header = pagesCount > 1
-        ? `📋 <b>Мои отклики: ${total}</b> · стр. ${currentPage} из ${pagesCount}`
-        : `📋 <b>Мои отклики: ${total}</b>`;
+        ? `📋 <b>Отклики HH: ${total}</b> · стр. ${currentPage} из ${pagesCount}`
+        : `📋 <b>Отклики HH: ${total}</b>`;
 
     let keyboard;
 
@@ -94,7 +91,7 @@ async function buildApplicationsPage(page) {
         keyboard = new InlineKeyboard();
 
         for (let number = 1; number <= pagesCount; number++) {
-            keyboard.text(number === currentPage ? `· ${number} ·` : String(number), `apps:${number}`);
+            keyboard.text(number === currentPage ? `· ${number} ·` : String(number), `${CALLBACK_PREFIX}apps:${number}`);
 
             if (number % PAGE_BUTTONS_PER_ROW === 0) {
                 keyboard.row();
@@ -108,206 +105,83 @@ async function buildApplicationsPage(page) {
     };
 }
 
-async function sendMyApplications(ctx) {
-    try {
-        const { text, keyboard } = await buildApplicationsPage(1);
+// Кнопка «📋 Отклики HH» внизу бота смотрителя.
+export async function sendMyApplications() {
+    const { text, keyboard } = await buildApplicationsPage(1);
 
-        await ctx.reply(text, {
-            parse_mode: 'HTML',
-            reply_markup: keyboard,
-            link_preview_options: { is_disabled: true },
-        });
-    } catch (error) {
-        console.error('Ошибка при получении списка откликов:', error);
-        await ctx.reply('Не удалось загрузить список откликов. Попробуй ещё раз.');
-    }
+    await api.sendMessage(chatId, text, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+        link_preview_options: { is_disabled: true },
+    });
 }
 
-// Обработчики команд и кнопок.
-function registerHandlers() {
-    // Пускаем к боту только владельца (TELEGRAM_CHAT_ID).
-    // /myid доступна всем: она нужна, чтобы узнать свой ID при настройке.
-    bot.use(async (ctx, next) => {
-        if (ctx.message?.text?.startsWith('/myid')) {
-            await next();
-            return;
+// Нажатие кнопки под сообщением HH. Возвращает текст всплывашки для смотрителя.
+export async function handleCallback(data, messageId) {
+    const [action, param] = String(data).slice(CALLBACK_PREFIX.length).split(':');
+
+    // «Пропустить»: помечаем вакансию и убираем сообщение из чата.
+    if (action === 'skip') {
+        await prisma.vacancy.update({
+            where: { hhId: param },
+            data: { isSkipped: true },
+        });
+
+        await api.deleteMessage(chatId, messageId);
+
+        return { text: 'Вакансия пропущена' };
+    }
+
+    // «Я отправила отклик»: запоминаем дату и убираем вакансию из чата.
+    if (action === 'applied') {
+        const vacancy = await prisma.vacancy.findUnique({
+            where: { hhId: param },
+        });
+
+        if (!vacancy) {
+            return { text: 'Вакансия не найдена в базе', alert: true };
         }
 
-        const currentChatId = ctx.chat?.id ?? ctx.from?.id;
-
-        if (chatId && String(currentChatId) === String(chatId)) {
-            await next();
-            return;
-        }
-
-        if (ctx.callbackQuery) {
-            await ctx.answerCallbackQuery({ text: 'Нет доступа' });
-        }
-    });
-
-    // Кнопка «Пропустить»: помечаем вакансию и убираем сообщение из чата.
-    bot.callbackQuery(/^skip:(.+)$/, async (ctx) => {
-        const hhId = ctx.match[1];
-
-        try {
+        // Повторное нажатие не перезаписывает дату отклика.
+        if (!vacancy.appliedAt) {
             await prisma.vacancy.update({
-                where: { hhId },
-                data: { isSkipped: true },
-            });
-
-            await ctx.answerCallbackQuery({
-                text: 'Вакансия пропущена',
-            });
-
-            await ctx.deleteMessage();
-        } catch (error) {
-            console.error('Ошибка при пропуске вакансии:', error);
-
-            await ctx.answerCallbackQuery({
-                text: 'Не удалось пропустить вакансию',
-                show_alert: true,
+                where: { hhId: param },
+                data: { appliedAt: new Date() },
             });
         }
-    });
 
-    // Кнопка «Я отправила отклик»: запоминаем дату и убираем вакансию из чата.
-    bot.callbackQuery(/^applied:(.+)$/, async (ctx) => {
-        const hhId = ctx.match[1];
+        await api.deleteMessage(chatId, messageId);
 
-        try {
-            const vacancy = await prisma.vacancy.findUnique({
-                where: { hhId },
-            });
+        return { text: 'Отклик сохранён в «Отклики HH»' };
+    }
 
-            if (!vacancy) {
-                await ctx.answerCallbackQuery({
-                    text: 'Вакансия не найдена в базе',
-                    show_alert: true,
-                });
-                return;
-            }
-
-            // Повторное нажатие не перезаписывает дату отклика.
-            if (!vacancy.appliedAt) {
-                await prisma.vacancy.update({
-                    where: { hhId },
-                    data: { appliedAt: new Date() },
-                });
-            }
-
-            await ctx.answerCallbackQuery({
-                text: 'Отклик сохранён в «Мои отклики»',
-            });
-
-            await ctx.deleteMessage();
-        } catch (error) {
-            console.error('Ошибка при сохранении отклика:', error);
-
-            await ctx.answerCallbackQuery({
-                text: 'Не удалось сохранить отклик',
-                show_alert: true,
-            });
-        }
-    });
-
-    // Листание списка «Мои отклики» кнопками с номерами страниц.
-    bot.callbackQuery(/^apps:(\d+)$/, async (ctx) => {
-        const page = Number(ctx.match[1]);
+    // Листание списка откликов кнопками с номерами страниц.
+    if (action === 'apps') {
+        const { text, keyboard } = await buildApplicationsPage(Number(param));
 
         try {
-            const { text, keyboard } = await buildApplicationsPage(page);
-
-            await ctx.editMessageText(text, {
+            await api.editMessageText(chatId, messageId, text, {
                 parse_mode: 'HTML',
                 reply_markup: keyboard,
                 link_preview_options: { is_disabled: true },
             });
-
-            await ctx.answerCallbackQuery();
         } catch (error) {
             // Нажали на текущую страницу — Telegram не даёт «изменить» на тот же текст.
-            if (error.description?.includes('message is not modified')) {
-                await ctx.answerCallbackQuery();
-                return;
+            if (!error.description?.includes('message is not modified')) {
+                throw error;
             }
-
-            console.error('Ошибка при листании откликов:', error);
-
-            await ctx.answerCallbackQuery({
-                text: 'Не удалось открыть страницу',
-                show_alert: true,
-            });
         }
-    });
 
-    // Кнопка «Мои отклики» внизу чата.
-    bot.hears(MY_APPLICATIONS_BUTTON, sendMyApplications);
-
-    // Команда /myapplications.
-    bot.command('myapplications', sendMyApplications);
-
-    // Команда /start.
-    bot.command('start', async (ctx) => {
-        await ctx.reply(
-            'Привет! Я HH Assistant 🤖\n\n' +
-            'Каждые полчаса проверяю новые вакансии на hh.ru и присылаю подходящие: ' +
-            'что требуют и черновик сопроводительного письма.\n\n' +
-            'Откликаешься ты сама на hh.ru: нажми на текст письма в сообщении — он скопируется целиком. ' +
-            'После отклика нажми «✅ Я отправила отклик» — вакансия попадёт в «📋 Мои отклики».',
-            {
-                reply_markup: mainKeyboard,
-            }
-        );
-    });
-
-    // Команда /myid.
-    bot.command('myid', async (ctx) => {
-        await ctx.reply(`Твой Telegram ID: ${ctx.from.id}`);
-    });
-
-    // Глобальный обработчик ошибок grammY.
-    bot.catch((error) => {
-        console.error('Ошибка Telegram-бота:', error);
-    });
-}
-
-if (bot) {
-    registerHandlers();
-}
-
-// Запускаем Telegram-бота и настраиваем команды.
-export async function startTelegramBot() {
-    if (!bot) {
-        console.warn('TELEGRAM_BOT_TOKEN не задан в .env — Telegram-бот не запущен');
-        return;
+        return { text: '' };
     }
 
-    // Настройка команд не должна блокировать запуск бота.
-    try {
-        await bot.api.setMyCommands([
-            { command: 'start', description: 'Запустить бота' },
-            { command: 'myapplications', description: 'Мои отклики' },
-            { command: 'myid', description: 'Показать Telegram ID' },
-        ]);
-    } catch (error) {
-        console.error(
-            'Не удалось настроить команды Telegram, продолжаем запуск:',
-            error.message
-        );
-    }
-
-    // Запускаем получение сообщений и обработку команд.
-    await bot.start({
-        onStart: (botInfo) => {
-            console.log(`Telegram-бот @${botInfo.username} запущен`);
-        },
-    });
+    return { text: 'Неизвестная кнопка', alert: true };
 }
 
 // Отправляем подходящую вакансию в Telegram.
 export async function sendVacancyToTelegram(vacancy) {
     if (!isTelegramConfigured()) {
-        throw new Error('Не заданы TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в файле .env');
+        throw new Error('Не заданы MAIN_BOT_TOKEN и MAIN_BOT_CHAT_ID в файле .env');
     }
 
     const conditions = [vacancy.workFormat, vacancy.employment, vacancy.experience && `опыт ${vacancy.experience}`]
@@ -345,10 +219,10 @@ export async function sendVacancyToTelegram(vacancy) {
     const keyboard = new InlineKeyboard()
         .url('🔗 Открыть вакансию', vacancy.url)
         .row()
-        .text('✅ Я отправила отклик', `applied:${vacancy.hhId}`)
-        .text('⏭ Пропустить', `skip:${vacancy.hhId}`);
+        .text('✅ Я отправила отклик', `${CALLBACK_PREFIX}applied:${vacancy.hhId}`)
+        .text('⏭ Пропустить', `${CALLBACK_PREFIX}skip:${vacancy.hhId}`);
 
-    const sentMessage = await bot.api.sendMessage(chatId, message, {
+    const sentMessage = await api.sendMessage(chatId, `🟦 <b>HH</b>\n${message}`, {
         reply_markup: keyboard,
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },

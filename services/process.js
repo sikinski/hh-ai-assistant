@@ -4,7 +4,7 @@ import { analyzeVacancy } from './ai.js';
 import { isLlmConfigured } from './llm.js';
 import { sendVacancyToTelegram, isTelegramConfigured } from './telegram.js';
 import {
-    HH_FILTERS,
+    HH_SEARCHES,
     HH_MAX_PAGES,
     HH_MAX_RESPONSES,
     HH_MIN_SALARY,
@@ -44,52 +44,73 @@ export async function syncVacancies() {
     let totalAvailable = 0;
     let pagesProcessed = 0;
 
-    for (let page = 0; page < HH_MAX_PAGES; page++) {
-        const result = await fetchHhVacancies(HH_FILTERS, page);
+    const errors = [];
 
-        totalAvailable = result.total;
-        fetched += result.vacancies.length;
-        pagesProcessed++;
-
-        let addedOnPage = 0;
-
-        for (const { compensation, ...vacancy } of result.vacancies) {
-            const prefilterReason = getPrefilterReason({ ...vacancy, compensation });
-
+    for (const search of HH_SEARCHES) {
+        for (let page = 0; page < HH_MAX_PAGES; page++) {
+            // Сбой одного поиска (капча hh, сеть) не должен останавливать остальные
+            let result;
             try {
-                await prisma.vacancy.create({
-                    data: prefilterReason
-                        ? { ...vacancy, isRelevant: false, aiReason: prefilterReason }
-                        : vacancy,
-                });
-
-                added++;
-                addedOnPage++;
-
-                if (prefilterReason) {
-                    prefiltered++;
-                }
+                result = await fetchHhVacancies(search.filters, page);
             } catch (error) {
-                if (error.code === 'P2002') {
-                    skipped++;
-                } else {
-                    throw error;
+                errors.push(error.message);
+                break;
+            }
+
+            if (page === 0) {
+                totalAvailable += result.total;
+            }
+            fetched += result.vacancies.length;
+            pagesProcessed++;
+
+            let addedOnPage = 0;
+
+            for (const { compensation, ...vacancy } of result.vacancies) {
+                const prefilterReason = getPrefilterReason({ ...vacancy, compensation });
+
+                try {
+                    await prisma.vacancy.create({
+                        data: prefilterReason
+                            ? { ...vacancy, isRelevant: false, aiReason: prefilterReason }
+                            : vacancy,
+                    });
+
+                    added++;
+                    addedOnPage++;
+
+                    if (prefilterReason) {
+                        prefiltered++;
+                    }
+                } catch (error) {
+                    if (error.code === 'P2002') {
+                        skipped++;
+                    } else {
+                        throw error;
+                    }
                 }
             }
-        }
 
-        // Выдача отсортирована по дате: если на странице нет новых,
-        // дальше будут только уже известные — не тратим запросы.
-        const isLastPage = (page + 1) * 20 >= result.total;
+            // Выдача отсортирована по дате: если на странице нет новых,
+            // дальше будут только уже известные — не тратим запросы.
+            const isLastPage = (page + 1) * 20 >= result.total;
 
-        if (addedOnPage === 0 || isLastPage) {
-            break;
+            if (addedOnPage === 0 || isLastPage) {
+                break;
+            }
+
+            await sleep(HH_REQUEST_DELAY);
         }
 
         await sleep(HH_REQUEST_DELAY);
     }
 
+    // Упали все поиски — это уже проблема, пусть будет видна в логе как ошибка
+    if (errors.length && pagesProcessed === 0) {
+        throw new Error(`hh.ru: ни один поиск не сработал — ${errors[0]}`);
+    }
+
     return {
+        errors,
         pagesProcessed,
         fetched,
         added,
@@ -172,6 +193,15 @@ export async function analyzePendingVacancies(app) {
                 reason: analysis.reason,
             });
         } catch (error) {
+            // Вакансию удалили с hh.ru — больше не пробуем
+            if (/HTTP (404|410)/.test(error.message)) {
+                await prisma.vacancy.update({
+                    where: { id: vacancy.id },
+                    data: { isRelevant: false, aiReason: 'Вакансия удалена с hh.ru' },
+                });
+                continue;
+            }
+
             // Лимит нейросети — не вина вакансии: не считаем попытку
             // и откладываем остальные до следующей проверки.
             if (error.status === 429) {
@@ -215,7 +245,7 @@ export async function analyzePendingVacancies(app) {
 export async function notifyPendingVacancies(app) {
     // Без Telegram вакансии ждут в базе и уйдут, когда бот будет настроен.
     if (!isTelegramConfigured()) {
-        app.log.warn('TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы — отправка пропущена');
+        app.log.warn('MAIN_BOT_TOKEN или MAIN_BOT_CHAT_ID не заданы — отправка пропущена');
         return { notified: 0, failed: 0 };
     }
 
@@ -255,10 +285,30 @@ export async function notifyPendingVacancies(app) {
     return { notified, failed };
 }
 
+// Шаги независимы: если hh.ru не отдал выдачу, всё равно оцениваем и отправляем то, что уже в базе.
+async function step(app, name, fn, fallback) {
+    try {
+        return await fn();
+    } catch (error) {
+        app.log.error({ err: error }, `Шаг «${name}» не удался, продолжаю со следующего`);
+        return fallback;
+    }
+}
+
 export async function processVacancies(app) {
-    const sync = await syncVacancies();
-    const analysis = await analyzePendingVacancies(app);
-    const notification = await notifyPendingVacancies(app);
+    const sync = await step(app, 'загрузка с hh.ru', syncVacancies, { added: 0, prefiltered: 0, errors: [] });
+    if (sync.errors.length) {
+        app.log.warn({ errors: sync.errors }, 'Часть поисков hh.ru не сработала');
+    }
+    const analysis = await step(app, 'оценка ИИ', () => analyzePendingVacancies(app), {
+        analyzed: 0,
+        failed: 0,
+        remaining: null,
+    });
+    const notification = await step(app, 'отправка в Telegram', () => notifyPendingVacancies(app), {
+        notified: 0,
+        failed: 0,
+    });
 
     return {
         status: 'ok',
